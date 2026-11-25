@@ -1,4 +1,6 @@
 # Xbox Series S alerts: OpenSooq -> Telegram (runs on GitHub Actions)
+import argparse
+import getpass
 import html
 import json
 import os
@@ -15,8 +17,8 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 OPENSOOQ_URLS = [
-    "https://jo.opensooq.com/ar/find?term=xbox+series+s",
-    "https://jo.opensooq.com/ar/find?term=اكس+بوكس+سيريس+اس",
+    "https://jo.opensooq.com/ar/العاب-فيديو-وملحقاتها/اجهزة-العاب/o37361-اكس-بوكس/اكس-بوكس-سيريس-اس",
+    "https://jo.opensooq.com/en/gaming-consoles/consoles/o37361-xbox/xbox-series-s",
 ]
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
@@ -30,6 +32,9 @@ HEADERS = {
 SERIES_S = re.compile(
     r"(series\s*s(?!\w))|(س[ي]?ر[ي]?[سز]\s*(?:اس|s)(?!\w))|((?<!\w)xss(?!\w))"
 )
+SERIES_X = re.compile(
+    r"(?<!\w)(?:series\s*x|series\s*s[\s/]*x|س[ي]?ر[ي]?[سز]\s*(?:اكس|x))(?!\w)"
+)
 OS_LINK = re.compile(r"/(?:ar|en)/search/(\d{5,})")
 
 
@@ -41,12 +46,18 @@ def normalize(text):
 
 
 def is_series_s(text):
-    return bool(SERIES_S.search(normalize(text)))
+    title = normalize(text)
+    return bool(SERIES_S.search(title) and not SERIES_X.search(title))
 
 
 def tg(method, **params):
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", data=params, timeout=40)
-    data = r.json()
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/{method}", data=params, timeout=40
+        )
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        raise RuntimeError(f"Telegram {method} failed to connect or returned an invalid response") from None
     if not data.get("ok"):
         raise RuntimeError(f"Telegram error: {data.get('description')}")
     return data["result"]
@@ -60,23 +71,38 @@ class AnchorParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.items = {}
-        self.cur = None
+        self.current = None
+        self.in_title = False
+        self.in_price = False
 
     def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
         if tag == "a":
-            href = dict(attrs).get("href") or ""
-            m = OS_LINK.search(href)
-            self.cur = m.group(1) if m else None
-            if m:
-                self.items.setdefault(self.cur, {"href": href, "text": ""})
+            href = attrs.get("href") or ""
+            match = OS_LINK.fullmatch(href)
+            self.current = match.group(1) if match and match.group(1) not in self.items else None
+            if self.current:
+                self.items[self.current] = {"href": href, "title": "", "price": ""}
+        elif self.current:
+            if tag == "h2":
+                self.in_title = True
+            elif tag == "span" and "text-lg" in (attrs.get("class") or "").split():
+                self.in_price = True
 
     def handle_endtag(self, tag):
         if tag == "a":
-            self.cur = None
+            self.current = None
+            self.in_title = self.in_price = False
+        elif tag == "h2":
+            self.in_title = False
+        elif tag == "span":
+            self.in_price = False
 
     def handle_data(self, data):
-        if self.cur:
-            self.items[self.cur]["text"] += " " + data
+        if self.current and self.in_title:
+            self.items[self.current]["title"] += data
+        if self.current and self.in_price:
+            self.items[self.current]["price"] += data
 
 
 def walk(node, out):
@@ -99,8 +125,12 @@ def parse(page, base):
     p = AnchorParser()
     p.feed(page)
     for pid, a in p.items.items():
-        ads[pid] = {"id": "os:" + pid, "title": re.sub(r"\s+", " ", a["text"]).strip(),
-                    "price": "", "url": urljoin(base, a["href"])}
+        title = " ".join(a["title"].split())
+        if title:
+            ads[pid] = {
+                "id": "os:" + pid, "title": title, "price": " ".join(a["price"].split()),
+                "url": urljoin(base, a["href"]),
+            }
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.S)
     if m:
         try:
@@ -123,7 +153,9 @@ def fetch(errors):
             r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
             found = parse(r.text, url)
-            print("opensooq:", len(found), "ads, html size", len(r.text))
+            print("opensooq:", r.status_code, len(found), "ads, html size", len(r.text))
+            if not found:
+                errors.append(f"HTTP {r.status_code}: ما لقيت إعلانات قابلة للقراءة")
             ads += found
         except Exception as e:
             print("opensooq error:", e)
@@ -132,7 +164,13 @@ def fetch(errors):
     return ads
 
 
-def main():
+def save(state):
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(STATE_FILE)
+
+
+def check():
     if not TOKEN:
         sys.exit("TELEGRAM_TOKEN secret is missing")
     if not CHAT_ID:
@@ -161,22 +199,49 @@ def main():
         for ad in ads:
             if ad["id"] not in seen and is_series_s(ad["title"]):
                 seen.add(ad["id"])
-                state["seen"].append(ad["id"])
                 fresh.append(ad)
         if not state["initialized"]:
             send(CHAT_ID, f"✅ البوت شغال. تجاهلت {len(fresh)} إعلان موجود، وببعتلك الجديد.")
+            state["seen"].extend(ad["id"] for ad in fresh)
             state["initialized"] = True
         else:
             for ad in fresh:
                 text = "🎮 <b>" + html.escape(ad["title"][:200]) + "</b>\n"
                 if ad["price"]:
                     text += "💰 " + html.escape(ad["price"]) + "\n"
-                send(CHAT_ID, text + ad["url"])
+                send(CHAT_ID, text + html.escape(ad["url"]))
+                state["seen"].append(ad["id"])
+                save(state)
                 time.sleep(1)
         print("new ads:", len(fresh))
 
     state["seen"] = state["seen"][-5000:]
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    save(state)
+
+
+def main():
+    global TOKEN, CHAT_ID
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watch", type=int, metavar="MINUTES", help="Run locally at a fixed interval")
+    args = parser.parse_args()
+    if args.watch is None:
+        check()
+        return
+    if args.watch < 5:
+        parser.error("--watch requires at least 5 minutes")
+    TOKEN = TOKEN or getpass.getpass("Telegram token: ")
+    CHAT_ID = CHAT_ID or getpass.getpass("Telegram chat ID: ")
+    if not re.fullmatch(r"\d+:[\w-]+", TOKEN) or not re.fullmatch(r"-?\d+", CHAT_ID):
+        parser.error("Invalid Telegram token or chat ID format.")
+    try:
+        while True:
+            try:
+                check()
+            except RuntimeError as error:
+                print(error, file=sys.stderr, flush=True)
+            time.sleep(args.watch * 60)
+    except KeyboardInterrupt:
+        print("Stopped.")
 
 
 if __name__ == "__main__":
