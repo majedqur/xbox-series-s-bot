@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "2-57/5 * * * *"
   workflow_dispatch:
+    inputs:
+      latest_ads:
+        description: Send the five latest priced listings
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -24,6 +29,7 @@ jobs:
       - run: pip install requests
       - name: Check for new ads
         env:
+          SEND_LATEST: ${{ inputs.latest_ads }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -31,7 +37,11 @@ jobs:
             echo "Add the TELEGRAM_TOKEN secret first"
             exit 0
           fi
-          python bot.py
+          if [ "$SEND_LATEST" = "true" ]; then
+            python bot.py --latest
+          else
+            python bot.py
+          fi
       - name: Save seen ads
         run: |
           git add state.json 2>/dev/null || exit 0
