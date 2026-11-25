@@ -1,0 +1,42 @@
+name: xbox-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xbox-bot
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Check for new ads
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ]; then
+            echo "Add the TELEGRAM_TOKEN secret first"
+            exit 0
+          fi
+          python bot.py
+      - name: Save seen ads
+        run: |
+          git add state.json 2>/dev/null || exit 0
+          git diff --cached --quiet && exit 0
+          git config user.name "xbox-bot"
+          git config user.email "xbox-bot@users.noreply.github.com"
+          git commit -m "update seen ads"
+          git push
