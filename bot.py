@@ -20,6 +20,8 @@ OPENSOOQ_URLS = [
     "https://jo.opensooq.com/ar/العاب-فيديو-وملحقاتها/اجهزة-العاب/o37361-اكس-بوكس/اكس-بوكس-سيريس-اس",
     "https://jo.opensooq.com/en/gaming-consoles/consoles/o37361-xbox/xbox-series-s",
 ]
+LATEST_SALES_URL = OPENSOOQ_URLS[1] + "?search=true&sort_code=recent&Post_type=7511"
+LATEST_COUNT = 5
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
 HEADERS = {
@@ -146,9 +148,11 @@ def parse(page, base):
     return list(ads.values())
 
 
-def fetch(errors):
+def fetch(errors, urls=OPENSOOQ_URLS):
     ads = []
-    for url in OPENSOOQ_URLS:
+    for index, url in enumerate(urls):
+        if index:
+            time.sleep(3)
         try:
             r = requests.get(url, headers=HEADERS, timeout=30)
             r.raise_for_status()
@@ -160,7 +164,6 @@ def fetch(errors):
         except Exception as e:
             print("opensooq error:", e)
             errors.append(str(e)[:150])
-        time.sleep(3)
     return ads
 
 
@@ -168,6 +171,46 @@ def save(state):
     temporary = STATE_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     temporary.replace(STATE_FILE)
+
+
+def send_latest():
+    sales = fetch([], [LATEST_SALES_URL])
+    newest = [ad for ad in sales if ad["price"] and is_series_s(ad["title"])][:LATEST_COUNT]
+    if not newest:
+        send(CHAT_ID, "ما قدرت ألاقي عروض بيع Xbox Series S بأسعارها على السوق المفتوح هسا.")
+        print("latest ads sent: 0")
+        return
+    rows = ["🎮 <b>أحدث عروض Xbox Series S في الأردن</b>", "المصدر: السوق المفتوح"]
+    for number, ad in enumerate(newest, start=1):
+        title = html.escape(ad["title"][:180])
+        url = html.escape(ad["url"], quote=True)
+        price = html.escape(ad["price"].replace("JOD", "د.أ"))
+        rows.append(f'{number}. <a href="{url}">{title}</a> — <b>{price}</b>')
+    send(CHAT_ID, "\n\n".join(rows))
+    print("latest ads sent:", len(newest))
+
+
+def check_commands(state):
+    try:
+        updates = tg(
+            "getUpdates", offset=state.get("telegram_offset", 0),
+            allowed_updates=json.dumps(["message"]), timeout=0,
+        )
+    except RuntimeError as error:
+        print("Could not read Telegram commands:", error)
+        return
+    if not updates:
+        return
+    for update in updates:
+        message = update.get("message", {})
+        if str(message.get("chat", {}).get("id")) != CHAT_ID:
+            continue
+        words = message.get("text", "").split()
+        if words and words[0].split("@", 1)[0].lower() == "/latest":
+            send_latest()
+            break
+    state["telegram_offset"] = max(update["update_id"] for update in updates) + 1
+    save(state)
 
 
 def check():
@@ -184,6 +227,7 @@ def check():
     state = {"seen": [], "initialized": False, "warned": False}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
+    check_commands(state)
 
     errors = []
     ads = fetch(errors)
@@ -222,8 +266,18 @@ def check():
 def main():
     global TOKEN, CHAT_ID
     parser = argparse.ArgumentParser()
-    parser.add_argument("--watch", type=int, metavar="MINUTES", help="Run locally at a fixed interval")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--watch", type=int, metavar="MINUTES", help="Run locally at a fixed interval")
+    mode.add_argument("--latest", action="store_true", help="Send the latest priced sales to Telegram")
     args = parser.parse_args()
+    if args.latest:
+        if not TOKEN or not CHAT_ID:
+            parser.error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are required")
+        send_latest()
+        tg("setMyCommands", commands=json.dumps([
+            {"command": "latest", "description": "أحدث إعلانات Xbox Series S وأسعارها"}
+        ], ensure_ascii=False))
+        return
     if args.watch is None:
         check()
         return
