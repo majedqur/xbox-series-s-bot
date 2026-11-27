@@ -16,11 +16,12 @@ import requests
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+ENGLISH_LISTINGS = "https://jo.opensooq.com/en/gaming-consoles/consoles/o37361-xbox/xbox-series-s"
 OPENSOOQ_URLS = [
+    ENGLISH_LISTINGS + "?search=true&sort_code=recent&Post_type=7511",
+    ENGLISH_LISTINGS,
     "https://jo.opensooq.com/ar/العاب-فيديو-وملحقاتها/اجهزة-العاب/o37361-اكس-بوكس/اكس-بوكس-سيريس-اس",
-    "https://jo.opensooq.com/en/gaming-consoles/consoles/o37361-xbox/xbox-series-s",
 ]
-LATEST_SALES_URL = OPENSOOQ_URLS[1] + "?search=true&sort_code=recent&Post_type=7511"
 LATEST_COUNT = 5
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
@@ -32,17 +33,23 @@ HEADERS = {
 }
 
 SERIES_S = re.compile(
-    r"(series\s*s(?!\w))|(س[ي]?ر[ي]?[سز]\s*(?:اس|s)(?!\w))|((?<!\w)xss(?!\w))"
+    r"(series\s*s(?!\w))|(س[ي]{0,2}ر[ي]{0,2}[سز]\s*(?:اس|s)(?!\w))|((?<!\w)xss(?!\w))"
 )
 SERIES_X = re.compile(
     r"(?<!\w)(?:series\s*x|series\s*s[\s/]*x|س[ي]?ر[ي]?[سز]\s*(?:اكس|x))(?!\w)"
 )
 OS_LINK = re.compile(r"/(?:ar|en)/search/(\d{5,})")
+WANTED = re.compile(
+    r"(?<!\w)(?:مطلوب(?:ة|ين)?|للشراء|بدور على|بدي اشتري|ابحث عن|ببحث عن|wtb)(?!\w)"
+    r"|^(?:مين (?:بلتقي )?عنده|(?:اللي|الي|لي) عنده|(?:للتبديل|للبدل) على|"
+    r"wanted|looking (?:to buy|for)|buying)(?!\w)"
+)
 
 
 def normalize(text):
     text = (text or "").lower()
     text = re.sub("[أإآ]", "ا", text).replace("ـ", "")
+    text = re.sub(r"[\u064b-\u065f\u0670\u200e\u200f]", "", text)
     text = re.sub(r"[-_/|،,.]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -50,6 +57,10 @@ def normalize(text):
 def is_series_s(text):
     title = normalize(text)
     return bool(SERIES_S.search(title) and not SERIES_X.search(title))
+
+
+def is_sale(text):
+    return is_series_s(text) and not WANTED.search(normalize(text))
 
 
 def tg(method, **params):
@@ -148,9 +159,8 @@ def parse(page, base):
     return list(ads.values())
 
 
-def fetch(errors, urls=OPENSOOQ_URLS):
-    ads = []
-    for index, url in enumerate(urls):
+def fetch(errors):
+    for index, url in enumerate(OPENSOOQ_URLS):
         if index:
             time.sleep(3)
         try:
@@ -158,13 +168,13 @@ def fetch(errors, urls=OPENSOOQ_URLS):
             r.raise_for_status()
             found = parse(r.text, url)
             print("opensooq:", r.status_code, len(found), "ads, html size", len(r.text))
-            if not found:
-                errors.append(f"HTTP {r.status_code}: ما لقيت إعلانات قابلة للقراءة")
-            ads += found
+            if r.status_code == 200 and found:
+                return found
+            errors.append(f"HTTP {r.status_code}: ما لقيت إعلانات قابلة للقراءة")
         except Exception as e:
             print("opensooq error:", e)
             errors.append(str(e)[:150])
-    return ads
+    return []
 
 
 def save(state):
@@ -174,8 +184,8 @@ def save(state):
 
 
 def send_latest():
-    sales = fetch([], [LATEST_SALES_URL])
-    newest = [ad for ad in sales if ad["price"] and is_series_s(ad["title"])][:LATEST_COUNT]
+    sales = fetch([])
+    newest = [ad for ad in sales if ad["price"] and is_sale(ad["title"])][:LATEST_COUNT]
     if not newest:
         send(CHAT_ID, "ما قدرت ألاقي عروض بيع Xbox Series S بأسعارها على السوق المفتوح هسا.")
         print("latest ads sent: 0")
@@ -227,8 +237,6 @@ def check():
     state = {"seen": [], "initialized": False, "warned": False}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
-    check_commands(state)
-
     errors = []
     ads = fetch(errors)
     if not ads:
@@ -240,8 +248,11 @@ def check():
         state["warned"] = False
         seen = set(state["seen"])
         fresh = []
+        rejected = 0
         for ad in ads:
-            if ad["id"] not in seen and is_series_s(ad["title"]):
+            if not is_sale(ad["title"]):
+                rejected += int(is_series_s(ad["title"]))
+            elif ad["id"] not in seen:
                 seen.add(ad["id"])
                 fresh.append(ad)
         if not state["initialized"]:
@@ -258,9 +269,11 @@ def check():
                 save(state)
                 time.sleep(1)
         print("new ads:", len(fresh))
+        print("wanted or exchange ads skipped:", rejected)
 
     state["seen"] = state["seen"][-5000:]
     save(state)
+    check_commands(state)
 
 
 def main():
@@ -281,8 +294,8 @@ def main():
     if args.watch is None:
         check()
         return
-    if args.watch < 5:
-        parser.error("--watch requires at least 5 minutes")
+    if args.watch < 2:
+        parser.error("--watch requires at least 2 minutes")
     TOKEN = TOKEN or getpass.getpass("Telegram token: ")
     CHAT_ID = CHAT_ID or getpass.getpass("Telegram chat ID: ")
     if not re.fullmatch(r"\d+:[\w-]+", TOKEN) or not re.fullmatch(r"-?\d+", CHAT_ID):
